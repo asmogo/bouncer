@@ -16,13 +16,23 @@ if [ -z "$CURRENT_REPO" ] || [ -z "$PR" ]; then
     exit 1
 fi
 
-if [ -z "$GITHUB_TOKEN" ] || [ -z "$REPORT_REPO" ]; then
-    echo "ERROR: GITHUB_TOKEN and REPORT_REPO must be set."
+if [ -z "$GITHUB_TOKEN" ]; then
+    echo "ERROR: GITHUB_TOKEN must be set."
     exit 1
 fi
 
-if [ -z "$OPENROUTER_API_KEY" ] && [ -z "$OPENAI_API_KEY" ] && [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$GOOGLE_API_KEY" ]; then
-    echo "ERROR: At least one API key (OPENROUTER_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, or GOOGLE_API_KEY) must be set."
+# REPORT_REPO is optional: when unset, findings are only stored in the local
+# encrypted database and no report PRs are opened (local-only reporting mode).
+if [ -n "$REPORT_REPO" ]; then
+    SUBMISSION_SNIPPET="/app/templates/submission/remote.txt"
+    echo "Reporting mode: remote (findings PRs go to $REPORT_REPO)"
+else
+    SUBMISSION_SNIPPET="/app/templates/submission/local.txt"
+    echo "Reporting mode: local (REPORT_REPO unset — findings stay in the encrypted database)"
+fi
+
+if [ -z "$OPENROUTER_API_KEY" ] && [ -z "$OPENAI_API_KEY" ] && [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$GOOGLE_API_KEY" ] && [ -z "$KIMI_API_KEY" ] && [ -z "$NUMES_API_KEY" ]; then
+    echo "ERROR: At least one API key (OPENROUTER_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, KIMI_API_KEY, or NUMES_API_KEY) must be set."
     exit 1
 fi
 
@@ -62,7 +72,7 @@ if ! git fetch origin; then
 fi
 
 # Fetch specific PR details
-PR_DATA=$(gh pr view "$PR" --json number,headRefOid,headRefName 2>/dev/null)
+PR_DATA=$(gh pr view "$PR" --json number,headRefOid,headRefName,baseRefName 2>/dev/null)
 
 if [ -z "$PR_DATA" ]; then
     echo "PR #$PR not found in $CURRENT_REPO or other error occurred."
@@ -71,6 +81,7 @@ fi
 
 HEAD_OID=$(echo "$PR_DATA" | jq -r '.headRefOid')
 HEAD_REF_NAME=$(echo "$PR_DATA" | jq -r '.headRefName')
+BASE_REF_NAME=$(echo "$PR_DATA" | jq -r '.baseRefName')
 
 if [ -z "$HEAD_OID" ] || [ "$HEAD_OID" == "null" ]; then
     echo "Could not extract headRefOid for PR #$PR"
@@ -94,61 +105,90 @@ cp -a "$BASE_CLONE_DIR" "$PR_WORKSPACE"
 cd "$PR_WORKSPACE"
 
 echo "Checking out PR #$PR (Commit: $HEAD_OID)..."
-if ! gh pr checkout "$PR"; then
+# Fetch the PR's persistent refs/pull/N/head ref: gh pr checkout fails for merged
+# PRs whose head branch was deleted (it fetches refs/heads/<branch> from origin).
+if ! git fetch origin "+refs/pull/${PR}/head" || ! git checkout --detach "$HEAD_OID"; then
     echo "Failed to checkout PR #$PR for $CURRENT_REPO"
     cd /app
     rm -rf "$PR_WORKSPACE"
     exit 1
 fi
 
+echo "Generating PR diff..."
+gh pr diff "$PR" > "$PR_WORKSPACE/.pr_diff.txt" || touch "$PR_WORKSPACE/.pr_diff.txt"
+
 REVIEW_TIMEOUT=${REVIEW_TIMEOUT:-"30m"}
 echo "Running opencode analysis on PR #$PR for $CURRENT_REPO (Timeout: $REVIEW_TIMEOUT)..."
 
-PR_REPORT="/out/report_${SAFE_REPO_NAME}_${PR}.txt"
-PR_METRICS="/out/metrics_${SAFE_REPO_NAME}_${PR}.json"
+PR_REPORT="/tmp/report_${SAFE_REPO_NAME}-${PR}.txt"
+PR_METRICS="/tmp/metrics_${SAFE_REPO_NAME}_${PR}.json"
+# Never allow output left by an interrupted earlier run to be ingested.
+rm -f "$PR_REPORT" "$PR_METRICS"
 
 # Export variables used in the prompt template
-export CURRENT_REPO PR_REPORT PR_METRICS REPORT_REPO PR HEAD_REF_NAME PR_WORKSPACE
+export CURRENT_REPO PR_REPORT PR_METRICS REPORT_REPO PR HEAD_REF_NAME BASE_REF_NAME PR_WORKSPACE
+
+# Render the submission phase (remote PRs vs local-only) for the prompt templates
+PR_SUBMISSION_PHASE=$(envsubst < "$SUBMISSION_SNIPPET")
+export PR_SUBMISSION_PHASE
 
 # Prepare runner for systemd-nspawn
-envsubst < /app/templates/prompt_template.txt > "$PR_WORKSPACE/.opencode_prompt"
+envsubst < /app/templates/discovery/discovery_template.txt > "$PR_WORKSPACE/.opencode_discovery_prompt"
+envsubst < /app/templates/verifier/verifier_template.txt > "$PR_WORKSPACE/.opencode_verifier_prompt"
 cp /app/scripts/opencode_runner.sh "$PR_WORKSPACE/.opencode_runner.sh"
 
-# Generate a valid, unique machine name (alphanumeric and dashes only)
-MACHINE_NAME="pr-${PR}-$(tr -dc 'a-f0-9' < /dev/urandom | head -c 8)"
+# Generate a valid, unique machine name (alphanumeric and dashes only).
+# nspawn names the host veth "vb-<machine>", capped at 15 chars (IFNAMSIZ),
+# so keep the machine name <= 12 chars to avoid truncation warnings.
+MACHINE_NAME="pr${PR}-$(tr -dc 'a-f0-9' < /dev/urandom | head -c 4)"
+if [ ${#MACHINE_NAME} -gt 12 ]; then
+    MACHINE_NAME="pr$(tr -dc 'a-f0-9' < /dev/urandom | head -c 10)"
+fi
 
 # Run the bot in its own ephemeral nspawn container using overlayfs
-if ! timeout -k 5m "$REVIEW_TIMEOUT" systemd-nspawn --quiet --keep-unit --register=no \
+timeout -k 5m "$REVIEW_TIMEOUT" systemd-nspawn --quiet --keep-unit --register=no \
     --machine="$MACHINE_NAME" \
     --volatile=overlay \
     -D /nspawn-root \
     --network-bridge=br-nspawn \
     --bind="$PR_WORKSPACE" \
-    --bind=/out \
+    --bind=/tmp \
     -E GITHUB_TOKEN="$GITHUB_TOKEN" \
     -E OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
     -E OPENAI_API_KEY="$OPENAI_API_KEY" \
     -E ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
     -E GOOGLE_API_KEY="$GOOGLE_API_KEY" \
+    -E KIMI_API_KEY="$KIMI_API_KEY" \
+    -E NUMES_API_KEY="$NUMES_API_KEY" \
     -E REPORT_REPO="$REPORT_REPO" \
     -E OPENCODE_MODEL="$OPENCODE_MODEL" \
     -E PR_METRICS="$PR_METRICS" \
-    /bin/bash -c "cd $PR_WORKSPACE && ./.opencode_runner.sh" > "/out/nspawn_${SAFE_REPO_NAME}_${PR}.log" 2>&1; then
-    
-    EXIT_CODE=$?
+    -E PR_REPORT="$PR_REPORT" \
+    /bin/bash -c "cd $PR_WORKSPACE && ./.opencode_runner.sh" > "/out/nspawn_${SAFE_REPO_NAME}_${PR}.log" 2>&1
+EXIT_CODE=$?
+if [ "$EXIT_CODE" -ne 0 ]; then
     if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ]; then
         echo "⚠️ Review for PR #$PR in $CURRENT_REPO timed out after $REVIEW_TIMEOUT."
     else
         echo "⚠️ Review for PR #$PR in $CURRENT_REPO failed with exit code $EXIT_CODE."
     fi
+    rm -f "$PR_REPORT" "$PR_METRICS"
+    cd /app
+    rm -rf "$PR_WORKSPACE"
+    exit "$EXIT_CODE"
 fi
 
-# Ingest report and metrics securely into the encrypted SQL database
+# Ingest report and metrics securely into the encrypted SQL database.
+# Reports declaring `finding: false` (clean PRs) are discarded, not stored.
 if [ -f "$PR_REPORT" ]; then
-    execute_sql_insert_file "$CURRENT_REPO" "$PR" "$HEAD_OID" "$PR_REPORT" "$PR_METRICS"
-    echo "✅ Report and metrics for PR #$PR securely saved to encrypted database."
-    
-    # Cleanup the flat files from the volume after successful database ingestion
+    if report_has_finding "$PR_REPORT"; then
+        execute_sql_insert_file "$CURRENT_REPO" "$PR" "$HEAD_OID" "$PR_REPORT" "$PR_METRICS"
+        echo "✅ Report and metrics for PR #$PR securely saved to encrypted database."
+    else
+        echo "ℹ️ Report for PR #$PR declares no finding (finding: false) — discarding."
+    fi
+
+    # Cleanup the flat files from the volume after handling
     rm -f "$PR_REPORT" "$PR_METRICS" "/out/nspawn_${SAFE_REPO_NAME}_${PR}.log"
 else
     echo "⚠️ No report was generated for PR #$PR by opencode."
