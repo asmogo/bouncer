@@ -27,8 +27,10 @@ verify_db_passphrase
 
 execute_sql() {
     local query="$1"
-    # Note: Use -batch to avoid interactive prompts
-    sqlcipher -batch -cmd "PRAGMA key = '${PASSPHRASE}';" "$DB_PATH" "$query"
+    # Note: Use -batch to avoid interactive prompts.
+    # SQLCipher 4.x prints "ok" for the PRAGMA key command; strip that first line so
+    # scalar query results (versions, OIDs, ledger text) stay clean.
+    sqlcipher -batch -cmd "PRAGMA key = '${PASSPHRASE}';" "$DB_PATH" "$query" | sed '1{/^ok$/d}'
 }
 
 # Helper to safely insert a file's contents into a BLOB column (which we can then cast to TEXT)
@@ -70,5 +72,69 @@ execute_sql_insert_file() {
     
     sql+=");"
     
+    execute_sql "$sql"
+}
+
+# Returns 0 when the report file declares an actual finding.
+# Reports whose YAML frontmatter sets `finding: false` are clean-PR
+# write-ups (no vulnerability identified) and must NOT be ingested.
+# A missing field is treated as a finding for backwards compatibility
+# with reports written before the field existed.
+report_has_finding() {
+    local report_file="$1"
+    # Inspect only the frontmatter block (between the first two --- lines)
+    if awk '/^---[[:space:]]*$/{c++; next} c==1' "$report_file" | \
+        grep -qiE '^finding:[[:space:]]*["'"'"']?false["'"'"']?[[:space:]]*$'; then
+        return 1
+    fi
+    return 0
+}
+
+# Mark all unresolved reports for a given PR as resolved by a later PR.
+# The reason text uses the same hex/CAST pattern as report ingestion so
+# arbitrary agent-written text cannot break the SQL.
+mark_report_resolved() {
+    local repo="$1"
+    local orig_pr="$2"
+    local resolved_by="$3"
+    local reason="$4"
+
+    local reason_hex=""
+    if [ -n "$reason" ]; then
+        reason_hex=$(printf '%s' "$reason" | od -A n -v -t x1 | tr -d ' \n')
+    fi
+
+    local sql="UPDATE pr_reports SET resolved_by_pr=${resolved_by}, resolved_at=CURRENT_TIMESTAMP"
+    if [ -n "$reason_hex" ]; then
+        sql+=", resolved_reason=CAST(X'${reason_hex}' AS TEXT)"
+    fi
+    sql+=" WHERE repo='${repo}' AND pr_number=${orig_pr} AND resolved_by_pr IS NULL;"
+
+    execute_sql "$sql"
+}
+
+# Retrieve the carry-forward findings ledger for a repo (empty if none exists yet)
+get_ledger() {
+    local repo="$1"
+    execute_sql "SELECT ledger_text FROM backfill_ledger WHERE repo='${repo}';"
+}
+
+# Safely store the findings ledger for a repo using the same hex/CAST pattern as reports
+put_ledger() {
+    local repo="$1"
+    local ledger_file="$2"
+    
+    local ledger_hex=""
+    if [ -f "$ledger_file" ]; then
+        ledger_hex=$(od -A n -v -t x1 < "$ledger_file" | tr -d ' \n')
+    fi
+
+    local sql="INSERT OR REPLACE INTO backfill_ledger (repo, ledger_text, updated_at) VALUES ('${repo}', "
+    if [ -n "$ledger_hex" ]; then
+        sql+="CAST(X'${ledger_hex}' AS TEXT), CURRENT_TIMESTAMP);"
+    else
+        sql+="'', CURRENT_TIMESTAMP);"
+    fi
+
     execute_sql "$sql"
 }

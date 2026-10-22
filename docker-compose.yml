@@ -12,7 +12,8 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-      - OPENCODE_MODEL=openrouter/google/gemini-3.1-pro-preview
+      - NUMES_API_KEY=${NUMES_API_KEY:-}
+      - OPENCODE_MODEL=${OPENCODE_MODEL:-openrouter/google/gemini-3.1-pro-preview}
       # Database encryption key (Required)
       - DB_PASSPHRASE=${DB_PASSPHRASE}
       # Time window for pulling PRs
@@ -30,4 +31,21 @@ services:
     volumes:
       # Maps the local ./out folder to /out inside the container for permanent storage
       - ./out:/out
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    container_name: bouncer-dashboard
+    command: python3 /app/dashboard/app.py
+    entrypoint: []
+    environment:
+      # Same SQLCipher key as the bouncer service (Required)
+      - DB_PASSPHRASE=${DB_PASSPHRASE}
+      # Optional bearer token to protect the dashboard (reports are sensitive)
+      - DASHBOARD_TOKEN=${DASHBOARD_TOKEN:-}
+    volumes:
+      # Read access to the encrypted database
+      - ./out:/out
+    ports:
+      - "${DASHBOARD_PORT:-5001}:5001"
     restart: unless-stopped

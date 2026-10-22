@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS pr_reports (
     metrics_json TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+PRAGMA journal_mode=WAL;
 "
 
 # 2. Get current migration version
@@ -70,6 +71,38 @@ if [ "$VERSION" -eq 0 ]; then
     
     execute_sql "INSERT INTO schema_migrations(version) VALUES(1);"
     echo "Migration 0 -> 1 complete."
+fi
+
+# Re-read the version in case migration 1 just ran on a fresh database
+VERSION=$(execute_sql "SELECT COALESCE(MAX(version), 0) FROM schema_migrations;")
+
+if [ "$VERSION" -lt 2 ]; then
+    echo "Running migration 1 -> 2 (Adding backfill_ledger table)..."
+
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS backfill_ledger (
+        repo TEXT PRIMARY KEY,
+        ledger_text TEXT,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    INSERT INTO schema_migrations(version) VALUES(2);
+    "
+    echo "Migration 1 -> 2 complete."
+fi
+
+# Re-read the version in case migration 2 just ran on a fresh database
+VERSION=$(execute_sql "SELECT COALESCE(MAX(version), 0) FROM schema_migrations;")
+
+if [ "$VERSION" -lt 3 ]; then
+    echo "Running migration 2 -> 3 (Adding resolution tracking to pr_reports)..."
+
+    execute_sql "
+    ALTER TABLE pr_reports ADD COLUMN resolved_by_pr INTEGER;
+    ALTER TABLE pr_reports ADD COLUMN resolved_reason TEXT;
+    ALTER TABLE pr_reports ADD COLUMN resolved_at DATETIME;
+    INSERT INTO schema_migrations(version) VALUES(3);
+    "
+    echo "Migration 2 -> 3 complete."
 fi
 
 echo "Database initialization complete."

@@ -16,7 +16,12 @@ RUN apt-get update && apt-get install -y \
     dnsmasq \
     isc-dhcp-client \
     iproute2 \
-    sqlcipher
+    sqlcipher \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-dev \
+    build-essential
 
 # Install GitHub CLI (gh)
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -25,18 +30,24 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
     && apt-get update \
     && apt-get install gh -y
 
+# Install Poetry
+ENV POETRY_HOME=/opt/poetry
+RUN curl -sSL https://install.python-poetry.org | python3 - \
+    && ln -s /opt/poetry/bin/poetry /usr/local/bin/poetry
+
 # Install opencode via NPM
 RUN npm install -g opencode-ai
+
+# Copy our application scripts, templates, and the report dashboard
+COPY scripts /app/scripts
+COPY templates /app/templates
+COPY dashboard /app/dashboard
+RUN chmod +x /app/scripts/*.sh
 
 # Copy the entire filesystem to /nspawn-root for the ephemeral nspawn containers
 RUN mkdir /nspawn-root && rsync -a --exclude=/dev --exclude=/proc --exclude=/sys --exclude=/tmp --exclude=/run --exclude=/mnt --exclude=/media --exclude=/lost+found --exclude=/nspawn-root / /nspawn-root/ && mkdir -p /nspawn-root/dev /nspawn-root/proc /nspawn-root/sys /nspawn-root/tmp /nspawn-root/run
 
 WORKDIR /app
 
-# Copy our application scripts and templates
-COPY scripts /app/scripts
-COPY templates /app/templates
-RUN chmod +x /app/scripts/*.sh
-
-# Start cron in the foreground via entrypoint
-CMD ["/app/scripts/entrypoint.sh"]
+# Setup entrypoint
+ENTRYPOINT ["/app/scripts/entrypoint.sh"]
