@@ -81,7 +81,10 @@ def main():
     try:
         request = Request(
             f"{BASE_URL}/models?supported_parameters=tools",
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "bouncer/numes-provider",
+            },
         )
         with urlopen(request, timeout=30) as response:
             catalog = json.load(response)

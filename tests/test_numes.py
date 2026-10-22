@@ -119,6 +119,7 @@ class NumesConfigTests(unittest.TestCase):
         request = fetch.call_args.args[0]
         self.assertEqual(request.full_url, f"{numes_config.BASE_URL}/models?supported_parameters=tools")
         self.assertEqual(request.get_header("Authorization"), "Bearer secret-test-key")
+        self.assertEqual(request.get_header("User-agent"), "bouncer/numes-provider")
         self.assertEqual(fetch.call_args.kwargs["timeout"], 30)
         self.assertNotIn("secret-test-key", stdout.getvalue())
         self.assertIn("numes", json.loads(stdout.getvalue())["provider"])
